@@ -17,7 +17,12 @@ import {
   type ReadStreamOptions,
   type ReadStreamResult,
 } from '@event-driven-io/emmett';
-import type { SQLiteConnection } from '../sqliteConnection';
+import {
+  sqliteConnection,
+  type AbsolutePath,
+  type RelativePath,
+  type SQLiteConnection,
+} from '../sqliteConnection';
 import { createEventStoreSchema } from './schema';
 import { appendToStream } from './schema/appendToStream';
 import { readStream } from './schema/readStream';
@@ -41,15 +46,44 @@ export type SQLiteEventStoreOptions = {
   schema?: {
     autoMigration?: 'None' | 'CreateOrUpdate';
   };
+  shouldManageClientLifetime?: boolean;
+  databaseLocation?: AbsolutePath | RelativePath | ':memory:';
 };
 
 export const getSQLiteEventStore = (
-  db: SQLiteConnection,
   options?: SQLiteEventStoreOptions,
 ): SQLiteEventStore => {
   let schemaMigrated = false;
-
   let autoGenerateSchema = false;
+  let db: SQLiteConnection | null;
+  const databaseLocation = options?.databaseLocation ?? null;
+
+  const isInMemory: boolean = databaseLocation === ':memory:';
+
+  const createConnection = () => {
+    if (db != null) {
+      return db;
+    }
+
+    if (options?.databaseLocation == null) {
+      throw new Error('Database location is not set');
+    }
+
+    return sqliteConnection({
+      location: databaseLocation,
+    });
+  };
+
+  const closeConnection = () => {
+    if (isInMemory) {
+      return;
+    }
+    if (db != null) {
+      db.close();
+      db = null;
+    }
+  };
+
   if (options) {
     autoGenerateSchema =
       options.schema?.autoMigration === undefined ||
@@ -58,7 +92,9 @@ export const getSQLiteEventStore = (
 
   const ensureSchemaExists = async (): Promise<void> => {
     if (!autoGenerateSchema) return Promise.resolve();
-
+    if (db == null) {
+      throw new Error('Database connection does not exist');
+    }
     if (!schemaMigrated) {
       await createEventStoreSchema(db);
       schemaMigrated = true;
@@ -85,7 +121,12 @@ export const getSQLiteEventStore = (
       if (typeof streamName !== 'string') {
         throw new Error('not string');
       }
-      const result = await this.readStream<EventType>(streamName, options.read);
+
+      if (db == null) {
+        db = createConnection();
+      }
+
+      const result = await readStream<EventType>(db, streamName, options.read);
 
       const currentStreamVersion = result.currentStreamVersion;
 
@@ -101,6 +142,8 @@ export const getSQLiteEventStore = (
         state = evolve(state, event);
       }
 
+      closeConnection();
+
       return {
         currentStreamVersion: currentStreamVersion,
         state,
@@ -114,8 +157,15 @@ export const getSQLiteEventStore = (
     ): Promise<
       ReadStreamResult<EventType, ReadEventMetadataWithGlobalPosition>
     > => {
+      if (db == null) {
+        db = createConnection();
+      }
+
       await ensureSchemaExists();
-      return await readStream<EventType>(db, streamName, options);
+      const stream = await readStream<EventType>(db, streamName, options);
+
+      closeConnection();
+      return stream;
     },
 
     appendToStream: async <EventType extends Event>(
@@ -123,6 +173,10 @@ export const getSQLiteEventStore = (
       events: EventType[],
       options?: AppendToStreamOptions,
     ): Promise<AppendToStreamResult> => {
+      if (db == null) {
+        db = createConnection();
+      }
+
       await ensureSchemaExists();
       // TODO: This has to be smarter when we introduce urn-based resolution
       const [firstPart, ...rest] = streamName.split('-');
@@ -137,6 +191,8 @@ export const getSQLiteEventStore = (
         events,
         options,
       );
+
+      closeConnection();
 
       if (!appendResult.success)
         throw new ExpectedVersionConflictError<bigint>(
