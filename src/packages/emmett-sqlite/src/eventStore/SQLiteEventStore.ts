@@ -17,7 +17,12 @@ import {
   type ReadStreamOptions,
   type ReadStreamResult,
 } from '@event-driven-io/emmett';
-import type { SQLiteConnection } from '../sqliteConnection';
+import {
+  sqliteConnection,
+  type AbsolutePath,
+  type RelativePath,
+  type SQLiteConnection,
+} from '../sqliteConnection';
 import { createEventStoreSchema } from './schema';
 import { appendToStream } from './schema/appendToStream';
 import { readStream } from './schema/readStream';
@@ -41,15 +46,39 @@ export type SQLiteEventStoreOptions = {
   schema?: {
     autoMigration?: 'None' | 'CreateOrUpdate';
   };
+  databaseLocation: AbsolutePath | RelativePath | ':memory:';
 };
 
 export const getSQLiteEventStore = (
-  db: SQLiteConnection,
-  options?: SQLiteEventStoreOptions,
+  options: SQLiteEventStoreOptions,
 ): SQLiteEventStore => {
   let schemaMigrated = false;
-
   let autoGenerateSchema = false;
+  let db: SQLiteConnection | null;
+  const databaseLocation = options.databaseLocation ?? null;
+
+  const isInMemory: boolean = databaseLocation === ':memory:';
+
+  const createConnection = () => {
+    if (db != null) {
+      return db;
+    }
+
+    return sqliteConnection({
+      location: databaseLocation,
+    });
+  };
+
+  const closeConnection = () => {
+    if (isInMemory) {
+      return;
+    }
+    if (db != null) {
+      db.close();
+      db = null;
+    }
+  };
+
   if (options) {
     autoGenerateSchema =
       options.schema?.autoMigration === undefined ||
@@ -58,7 +87,9 @@ export const getSQLiteEventStore = (
 
   const ensureSchemaExists = async (): Promise<void> => {
     if (!autoGenerateSchema) return Promise.resolve();
-
+    if (db == null) {
+      throw new Error('Database connection does not exist');
+    }
     if (!schemaMigrated) {
       await createEventStoreSchema(db);
       schemaMigrated = true;
@@ -83,9 +114,22 @@ export const getSQLiteEventStore = (
       let state = initialState();
 
       if (typeof streamName !== 'string') {
-        throw new Error('not string');
+        throw new Error('Stream name is not string');
       }
-      const result = await this.readStream<EventType>(streamName, options.read);
+
+      if (db == null) {
+        db = createConnection();
+      }
+
+      let result;
+      try {
+        result = await readStream<EventType>(db, streamName, options.read);
+      } catch (err: Error) {
+        closeConnection();
+        throw err;
+      }
+
+      closeConnection();
 
       const currentStreamVersion = result.currentStreamVersion;
 
@@ -114,8 +158,22 @@ export const getSQLiteEventStore = (
     ): Promise<
       ReadStreamResult<EventType, ReadEventMetadataWithGlobalPosition>
     > => {
-      await ensureSchemaExists();
-      return await readStream<EventType>(db, streamName, options);
+      if (db == null) {
+        db = createConnection();
+      }
+
+      let stream;
+      try {
+        await ensureSchemaExists();
+        stream = await readStream<EventType>(db, streamName, options);
+      } catch (err: Error) {
+        closeConnection();
+        throw err;
+      }
+
+      closeConnection();
+
+      return stream;
     },
 
     appendToStream: async <EventType extends Event>(
@@ -123,20 +181,34 @@ export const getSQLiteEventStore = (
       events: EventType[],
       options?: AppendToStreamOptions,
     ): Promise<AppendToStreamResult> => {
-      await ensureSchemaExists();
+      if (db == null) {
+        db = createConnection();
+      }
+
       // TODO: This has to be smarter when we introduce urn-based resolution
       const [firstPart, ...rest] = streamName.split('-');
 
       const streamType =
         firstPart && rest.length > 0 ? firstPart : 'emt:unknown';
 
-      const appendResult = await appendToStream(
-        db,
-        streamName,
-        streamType,
-        events,
-        options,
-      );
+      let appendResult;
+
+      try {
+        await ensureSchemaExists();
+
+        appendResult = await appendToStream(
+          db,
+          streamName,
+          streamType,
+          events,
+          options,
+        );
+      } catch (err: Error) {
+        closeConnection();
+        throw err;
+      }
+
+      closeConnection();
 
       if (!appendResult.success)
         throw new ExpectedVersionConflictError<bigint>(
